@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.open.lynx">
+
+    <!--
+      This app is a thin test panel for the rebuilt Alpha2 SDK
+      (com.ubtechinc.alpha.serverlibutil.aidl, confirmed against
+      com.ubtechinc.alpha2services_base.3.002.apk). It has one Activity with a button
+      per AIDL call and a scrolling log - no HTTP/WebSocket server, camera, or audio
+      recording, unlike the old test panel this replaces.
+    -->
+
+    <application
+        android:allowBackup="true"
+        android:label="Open Lynx"
+        android:icon="@android:drawable/ic_menu_manage"
+        android:theme="@android:style/Theme.Material.Light">
+
+        <activity
+            android:name=".MainActivity"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+</manifest>
