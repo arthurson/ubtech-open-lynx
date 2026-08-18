@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.open.lynx">
+    package="com.open.alpha2">
 
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -24,7 +24,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="OpenLynx"
+        android:label="Open Alpha2"
         android:icon="@android:drawable/ic_menu_manage"
         android:largeHeap="true"
         android:theme="@android:style/Theme.Material.Light">
@@ -38,6 +38,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          Legacy UBTECH app id meta-data. Alpha2OpenSdk removes the store-authorization
+          check entirely, so this value is never validated against any server - but the
+          SDK still reads a non-empty string here structurally.
+        -->
+        <meta-data
+            android:name="alpha2_appid"
+            android:value="222B998EDFA5FAD7FCE78678FB9F2521" />
 
         <!--
           RobotEventReceiver is registered dynamically in MainActivity.onCreate() instead

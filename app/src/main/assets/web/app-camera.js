@@ -1,4 +1,4 @@
-// OpenLynx — client logic (app-camera.js)
+// Open Alpha2 — client logic (app-camera.js)
 // 呢個檔案係由原本單一嘅 app.js 拆出嚟嘅其中一份, 內容: 相機直播、影相、錄影、拖拽準星頭部瞄準。
 // 全部檔案共用 window/global scope (冇用 ES module), 載入順序由 index.html 嘅
 // <script src="..."> 順序決定 - 詳見 index.html 頭嗰段 comment。
@@ -34,13 +34,14 @@ function cameraElements() {
     resolution: document.getElementById("cameraResolution"),
     crosshairPad: document.getElementById("crosshairPad"),
     crosshairMark: document.getElementById("crosshairMark"),
-    // "featureEnabled" is the single master checkbox that gates the head-aim joystick
-    // pad overlay - kept under the name crosshairToggle here since all the existing
-    // crosshair drag-to-aim code below already reads els.crosshairToggle. (Historically
-    // this checkbox also gated a mic-listen headphone FAB and a walkie-talkie talk FAB;
-    // both features have since been removed entirely, along with their FABs.)
+    // "featureEnabled" is the single master checkbox that now gates all three
+    // overlay features together (head-aim joystick pad, mic-listen headphone FAB,
+    // talk FAB) - kept under the name crosshairToggle here since all the existing
+    // crosshair drag-to-aim code below already reads els.crosshairToggle.
     crosshairToggle: document.getElementById("featureEnabled"),
     fabRow: document.getElementById("fabRow"),
+    micListenFab: document.getElementById("micListenFab"),
+    talkFab: document.getElementById("talkFab"),
   };
 }
 
@@ -147,16 +148,15 @@ async function takePhoto() {
       return;
     }
     // 快門聲由機械人本身出 (見 MainActivity#playShutterCue - 播 "Sirrah" 呢個系統
-    // 鈴聲), 唔係喺瀏覽器度合成音效 - 呢個 endpoint 本身係 shared hardware, 用
-    // hwApi()。
-    hwApi("camera/shutter_sound");
+    // 鈴聲), 唔係喺瀏覽器度合成音效。
+    api("camera/shutter_sound");
     flashCaptureLed();
     const byteChars = atob(json.jpegBase64);
     const bytes = new Uint8Array(byteChars.length);
     for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
     const blob = new Blob([bytes], { type: "image/jpeg" });
     const url = URL.createObjectURL(blob);
-    const filename = "lynx-photo-" + Date.now() + ".jpg";
+    const filename = "alpha2-photo-" + Date.now() + ".jpg";
     addCaptureItem("photo", url, filename);
     hint.textContent = "已影相 ✓";
   } catch (e) {
@@ -165,11 +165,36 @@ async function takePhoto() {
   }
 }
 
-/** 影相一刻頭/眼 LED 白燈閃半秒 - 依家未實現 (Lynx 5-mic head/eye LED 冇「閃一下
- *  就自動停」嘅 preset, 同 Alpha2 舊版嘅 "flash" preset 唔同, 要另外自己計時做
- *  timed on/off 先做到同一個效果 - 呢個純粹係 cosmetic 提示, 唔影響核心影相
- *  功能, 所以暫時淨係留空, 冇再郁 head/eye LED)。 */
+/** 影相一刻頭/眼 LED 白燈閃半秒。"flash" preset 本身會不斷循環閃落去唔會自動停
+ *  (見 led/head/set 個 p5/p6/p7 timing), 所以要自己計時, 500ms 後主動送返
+ *  stop / 或者還原返錄影中/聽聲中嗰個長開色 (見 restoreBaseLed()) - 唔係淨係盲目
+ *  stop, 否則影相嗰刻如果啱啱好錄緊影/聽緊聲, 個燈會俾呢下閃燈永久蓋走底層長開色。 */
 function flashCaptureLed() {
+  const headBrightness = document.getElementById("headBrightness").value;
+  const eyeBrightness = document.getElementById("eyeBrightness").value;
+  api("led/head/set", { preset: "flash", color: 7, brightness: headBrightness });
+  api("led/eye/set", { preset: "flash", color: 7, brightness: eyeBrightness });
+  setTimeout(restoreBaseLed, 500);
+}
+
+/** 攞返而家「底層」應該長開嘅 LED 狀態 - 錄影中(紅) > 聽機械人中(綠) > 冇(熄)。
+ *  影相閃燈完之後、或者其他一次性效果完咗之後, 用嚟還原返正確嘅長開狀態。 */
+function restoreBaseLed() {
+  const headBrightness = document.getElementById("headBrightness").value;
+  const eyeBrightness = document.getElementById("eyeBrightness").value;
+  let color = null;
+  if (mediaRecorder && mediaRecorder.state === "recording") {
+    color = 1; // 紅 - 錄影中
+  } else if (micListening) {
+    color = 2; // 綠 - 聽機械人中
+  }
+  if (color === null) {
+    api("led/head/set", { preset: "stop" });
+    api("led/eye/set", { preset: "stop" });
+  } else {
+    api("led/head/set", { preset: "long", color: color, brightness: headBrightness });
+    api("led/eye/set", { preset: "long", color: color, brightness: eyeBrightness });
+  }
 }
 
 // ---------------- Camera: video recording (client-side) ----------------
@@ -277,10 +302,17 @@ function stopRecording() {
   setRecordingLed(false);
 }
 
-/** 錄影中/聽機械人中嘅長開 LED 指示 - 依家未實現, 見 flashCaptureLed() 嘅
- *  comment (Lynx 冇對應嘅「長開純色」快速 preset, 純粹係 cosmetic 提示, 唔影響
- *  核心錄影功能)。 */
+/** 錄影中頭/眼 LED 長開紅燈, 停止錄影就熄返。 */
 function setRecordingLed(on) {
+  if (on) {
+    const headBrightness = document.getElementById("headBrightness").value;
+    const eyeBrightness = document.getElementById("eyeBrightness").value;
+    api("led/head/set", { preset: "long", color: 1, brightness: headBrightness });
+    api("led/eye/set", { preset: "long", color: 1, brightness: eyeBrightness });
+  } else {
+    api("led/head/set", { preset: "stop" });
+    api("led/eye/set", { preset: "stop" });
+  }
 }
 
 // ---------------- Camera crosshair: drag-to-aim head control (servo 19 pan / 20 tilt) ----
@@ -322,6 +354,13 @@ function updateCrosshairVisibility() {
   if (els.fabRow) {
     els.fabRow.classList.toggle("active", shouldShow);
   }
+  // Unticking the master checkbox (or stopping the camera) must not leave mic-listen
+  // or push-to-talk silently running with their FABs hidden - force both off so the
+  // control state always matches what's actually visible on screen.
+  if (!shouldShow) {
+    if (micListening) stopMicListen();
+    if (talkActive) stopTalk();
+  }
 }
 
 function setupCrosshairIfNeeded() {
@@ -345,22 +384,12 @@ function setupCrosshairIfNeeded() {
   function sendServoForAxis(nx, ny) {
     const panAngle = crosshairAxisToAngle(19, nx);
     const tiltAngle = crosshairAxisToAngle(20, ny);
-    // Same hardware, same servo 19/20 pan/tilt calibration (see SERVO_CALIBRATION).
-    // Lynx must send both servos in ONE call (motor/set_all -> AIDL
-    // motor_setAllMotorAbsoluteAngle, a single binder transaction) rather than two
-    // separate requests - sending id 19 and id 20 as two independent fetches let the
-    // second request's in-flight move interrupt/override the first's before it
-    // finished, so the pad's diagonal drags never actually reached both servos
-    // together. One set_all call also halves the network round-trips per drag update.
-    //
-    // Uses the same move-time setting as the Servo tab (lynxServoTime()), matching how
+    // Uses the same move-time setting as the Servo tab (servoTime()), matching how
     // this worked before - back to the person's original setting rather than a
     // hardcoded joystick-only value.
-    const time = lynxServoTime();
-    const pairs = [];
-    if (panAngle !== null) pairs.push("19:" + panAngle);
-    if (tiltAngle !== null) pairs.push("20:" + tiltAngle);
-    if (pairs.length) lynxApi("motor/set_all", { angles: pairs.join(","), time: time });
+    const time = servoTime();
+    if (panAngle !== null) api("servo/one", { id: 19, angle: panAngle, time: time });
+    if (tiltAngle !== null) api("servo/one", { id: 20, angle: tiltAngle, time: time });
   }
 
   function sendServoThrottled(nx, ny) {
@@ -431,7 +460,7 @@ function setupCrosshairIfNeeded() {
 
   els.crosshairToggle.addEventListener("change", updateCrosshairVisibility);
 
-  // ---- Keyboard control: arrow keys -> servo 19/20 (pan/tilt) ----
+  // ---- Keyboard control: arrow keys -> servo 19/20 (pan/tilt), held Space -> talk ----
   //
   // Reuses the same axisToAngle/throttle/knob-position plumbing as pointer-drag above,
   // so keyboard and mouse/touch control feel identical and never fight each other -
@@ -473,6 +502,12 @@ function setupCrosshairIfNeeded() {
       }
       return;
     }
+    if (evt.key === " " || evt.code === "Space") {
+      evt.preventDefault(); // stop Space from also activating a focused button/etc.
+      if (!evt.repeat) startTalk(); // ignore the browser's own key-repeat firing, since
+                                      // startTalk() is idempotent (talkActive guard) but
+                                      // there's no need to call it repeatedly anyway
+    }
   });
 
   els.viewport.addEventListener("keyup", function (evt) {
@@ -485,11 +520,14 @@ function setupCrosshairIfNeeded() {
       }
       return;
     }
+    if (evt.key === " " || evt.code === "Space") {
+      stopTalk();
+    }
   });
 
   // If the viewport loses keyboard focus entirely (Tab away, click elsewhere) while a
   // key was physically still held down, the corresponding keyup event never reaches
-  // this listener - without this, the head could get stuck "on" until some
+  // this listener - without this, the head or mic could get stuck "on" until some
   // other event happened to reset it.
   els.viewport.addEventListener("blur", function () {
     if (heldArrowKeys.size > 0) {
@@ -497,7 +535,27 @@ function setupCrosshairIfNeeded() {
       setKnobPosition(0, 0);
       sendServoForAxis(0, 0);
     }
+    if (talkActive) stopTalk();
   });
+
+  // ---- Talk FAB: press-and-hold (mouse/touch), mirroring a physical walkie-talkie's
+  // call button - replaces the old dedicated #talkBtn's inline onmousedown/ontouchstart
+  // attributes now that the button is generated inside the viewport rather than in the
+  // static toolbar row. ----
+  if (els.talkFab) {
+    els.talkFab.addEventListener("pointerdown", function (evt) {
+      evt.preventDefault();
+      // Capture the pointer so pointerup still fires on this element even if the
+      // finger/mouse drags off the FAB before releasing - without this, dragging off
+      // while still pressed would leave talkActive stuck "on" until pointerleave
+      // (which covers mouse hover-out, but not always a moved touch-point reliably).
+      try { els.talkFab.setPointerCapture(evt.pointerId); } catch (e) { /* ignore */ }
+      startTalk();
+    });
+    els.talkFab.addEventListener("pointerup", function () { stopTalk(); });
+    els.talkFab.addEventListener("pointerleave", function () { stopTalk(); });
+    els.talkFab.addEventListener("pointercancel", function () { stopTalk(); });
+  }
 }
 
 /** (Re)points the viewport's <img> at a fresh /stream/camera connection. A query-string

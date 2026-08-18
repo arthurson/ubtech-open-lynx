@@ -1,257 +1,32 @@
-// OpenLynx — client logic (app-core.js)
-// 呢個檔案係由原本單一嘅 app.js 拆出嚟嘅其中一份, 內容: 全局狀態、UI 語言字典、servo 校準表、lynxApi()/hwApi() 呢啲所有其他 app-*.js 都要用嘅核心 helper。呢個檔案要第一個 load。
+// Open Alpha2 — client logic (app-core.js)
+// 呢個檔案係由原本單一嘅 app.js 拆出嚟嘅其中一份, 內容: 全局狀態、UI 語言字典、servo 校準表、api()/hwApi() 呢啲所有其他 app-*.js 都要用嘅核心 helper。呢個檔案要第一個 load。
 // 全部檔案共用 window/global scope (冇用 ES module), 載入順序由 index.html 嘅
 // <script src="..."> 順序決定 - 詳見 index.html 頭嗰段 comment。
 
-// OpenLynx — client logic.
+// Open Alpha2 — client logic.
 // Talks to the on-robot HTTP server (HttpServer.java) via /api/*, and to the
 // WebSocket event log (WebSocketServer.java) via /ws.
 
 const API = "/api/";
 
 // ---------------- App / project metadata ----------------
-// APP_VERSION/APP_REPO_URL 呢兩個常數而家冇再喺 HTML 網頁 (index.html) 度用 -
-// 版本號改咗擺喺機身/手機原生畫面 (MainActivity.java 個 onCreate() 起嗰個
-// TextView UI, 顯示緊 http://<ip>:8888/ 嗰版), 唔喺呢個 web panel 度顯示。留低
-// 呢兩個常數純粹係俾第日想加返 HTML 版顯示時有一個現成嘅 single source of
-// truth, 唔使周圍搵散落嘅字串。
+// APP_VERSION/APP_REPO_URL/XIAOZHI_CONSOLE_URL 呢三個常數而家冇再喺 HTML 網頁
+// (index.html) 度用 - 小智／原始碼連結、版本號改咗擺喺機身/手機原生畫面
+// (MainActivity.java 個 onCreate() 起嗰個 TextView UI, 顯示緊 http://<ip>:8888/
+// 嗰版), 唔喺呢個 web panel 度顯示。留低呢三個常數純粹係俾第日想加返
+// HTML 版顯示時有一個現成嘅 single source of truth, 唔使周圍搵散落嘅字串。
 const APP_VERSION = "beta2";
-const APP_REPO_URL = "https://github.com/arthurson/ubtech-open-lynx";
-
-// ---------------- Action categories (shared data/DOM helpers) ----------------
-// 動作分類機制 - Alpha2/Lynx 兩邊都用緊, 因為 action_classification.json 嘅 key
-// 係機身 action 服務嘅 id (兩邊 ActionInfo.getId() 都係同一份), 分類表可以直接
-// 共用, 唔使機身額外提供多一份 Lynx 專用嘅分類 json。呢個 SDK 淨係支援 Lynx
-// backend, 但呢組 helper 本身冇 backend 之分, 擺喺 app-core.js (第一個 load
-// 嘅檔案) 等 app-lynx.js 用得到。
-
-// Categories as returned by the robot's own action list (row[1] = type). The
-// robot's static action-info file uses numeric types (1/2/3/4); some runtime
-// builds report the same categories as text instead. Either way each of
-// basic/dance/story/yoga gets its own sub-tab with a distinct theme colour;
-// anything not in this whitelist (regardless of what the raw type string
-// actually says) falls back to a shared "others" sub-tab - the whitelist
-// approach means no unknown category value ever needs to be spelled out
-// literally here.
-const ACTION_CATEGORIES = [
-  { key: "basic",  label: "基本", labelEn: "Basic", color: "#3b7dff" },
-  { key: "dance",  label: "跳舞", labelEn: "Dance", color: "#db2777" },
-  { key: "story",  label: "故事", labelEn: "Story", color: "#d97706" },
-  { key: "yoga",   label: "瑜伽", labelEn: "Yoga",  color: "#16a34a" },
-  { key: "others", label: "其他", labelEn: "Other", color: "#6b7280" },
-];
-// 白名單: 數字 type (actionInfo.txt 靜態格式) 同文字 type (部分機身 runtime 格式) 都對應埋。
-const ACTION_CATEGORY_MAP = {
-  "1": "basic", "2": "dance", "3": "story", "4": "yoga",
-  basic: "basic", dance: "dance", story: "story", yoga: "yoga",
-};
-
-// 動作 ID -> {main, sub} 嘅子分類對照表, 由 action_classification.json 讀入 (見
-// action_classified.txt 嘅整理來源)。呢個 mapping 淨係喺 asset 檔案有出現嘅動作先會有
-// sub 分類 - 冇出現嘅動作仍然跟返 categoryOf() 嗰個大分類, 但喺嗰個大分類入面冇
-// 子分類 tab 可以揀 (即係直接混喺主列表, 冚方向上等於落咗嗰個大分類嘅"其他")。
-// 呢個表故意唔喺 code 度寫死: 下次要再分類就淨係改/換份 json, 唔使動 app-core.js。
-let actionClassification = {}; // id -> {main, sub}
-
-function loadActionClassification() {
-  return fetch("action_classification.json").then(function (r) {
-    if (!r.ok) throw new Error("http " + r.status);
-    return r.json();
-  }).then(function (json) {
-    actionClassification = json || {};
-  }).catch(function (e) {
-    // 冇呢個檔案或者讀取失敗都唔應該累到成個動作 tab 用唔到 - 淨係冇子分類 tab,
-    // 主分類(基本/跳舞/故事/瑜伽/其他)照舊運作。
-    console.warn("action_classification.json 讀取失敗, 子分類 tab 將唔會出現:", e);
-    actionClassification = {};
-  });
-}
-
-function categoryOf(rawType) {
-  return ACTION_CATEGORY_MAP[rawType] || "others";
-}
-
-/** 攞返一個動作嘅子分類名 (例如「移動類」), 冇對照到就 null。 */
-function subCategoryOf(action) {
-  const entry = actionClassification[action.id];
-  return entry ? entry.sub : null;
-}
-
-// Fixed palette for sub-category tabs (移動類/手勢類/...), cycled by index so each
-// sub-category gets a distinct, stable colour regardless of which main category it's
-// under - deliberately a separate palette from ACTION_CATEGORIES' colours so the two
-// tab levels stay visually distinguishable from each other.
-const SUB_CATEGORY_COLORS = [
-  "#0891b2", "#ca8a04", "#9333ea", "#059669", "#e11d48",
-  "#2563eb", "#c2410c", "#4d7c0f", "#be185d", "#0d9488",
-];
-
-// English labels for the sub-categories that come from action_classification.json
-// (see loadActionClassification() above). The Chinese string is still the filter key
-// used everywhere else (subCategoryOf() / activeActionSubCategory) - this table is
-// purely for what's shown on the tab when uiLang === "en", so it never needs to touch
-// action_classification.json or action_classified.txt (source of truth for the actual
-// classification). Add an entry here whenever a new sub value shows up in that file.
-const SUB_CATEGORY_LABELS_EN = {
-  "移動類":            "Locomotion",
-  "手勢類":            "Gestures",
-  "頭部類":            "Head",
-  "表情 / 互動類":      "Expression / Interaction",
-  "全身 / 其他動作":    "Full Body / Other",
-  "伸展式":            "Stretch",
-  "站立式 / 平衡式":    "Standing / Balance",
-  "騎馬式":            "Horse Stance",
-  "踢腿 / 動態式":      "Kick / Dynamic",
-  "流行 / 節奏舞蹈":    "Pop / Rhythm Dance",
-  "兒童歌曲 / 卡通舞蹈": "Kids Songs / Cartoon Dance",
-  "品牌 / 客製舞蹈":    "Brand / Custom Dance",
-  "中國寓言":          "Chinese Fables",
-  "西方寓言 / 故事":    "Western Fables / Stories",
-};
-
-/** 攞返一個子分類應該顯示嘅名: 跟主 UI 語言 (uiLang)。內部 filter 仍然用返 `sub`
- *  (中文) 呢個 key, 呢個 function 淨係用喺顯示層。冇對照到就照原文顯示, 唔會有
- *  空白 tab。 */
-function subCategoryDisplayName(sub) {
-  if (uiLang === "en") {
-    return SUB_CATEGORY_LABELS_EN[sub] || sub;
-  }
-  return sub;
-}
-
-/** 建立第二層子分類 tab (例如 基本 之下嘅 移動類/手勢類/頭部類/...) 嘅共用邏輯。
- *  action_classification.json 嘅 key 係機身 action 服務嘅 id, 所以呢份分類表
- *  可以畀唔同 caller (目前即係 app-lynx.js 嘅 buildLynxActionSubSubTabs())
- *  共用, 唔使複製多一份。只有 action_classification.json 對呢個大分類有出現嘅
- *  子分類先會出 tab - 冇資料就唔顯示呢層 tab bar, 直接顯示嗰個大分類入面成個
- *  flat 清單。An always-present「全部」tab 清空子分類篩選。
- *  @param barElId       子分類 tab bar 容器嘅 id
- *  @param actions       完整動作陣列 (lynxAllActions)
- *  @param mainCategory  目前揀咗嘅大分類 key (activeLynxActionCategory)
- *  @param getActiveSub  () => 目前揀咗嘅子分類 (null = 全部)
- *  @param setActiveSub  (sub) => void, 寫返去嗰個 caller 自己嘅 activeXxxSubCategory 變數
- *  @param onChange      揀咗新子分類之後要做嘅嘢 (重畫 tab bar + 重畫動作清單)
- */
-function buildActionSubSubTabsShared(barElId, actions, mainCategory, getActiveSub, setActiveSub, onChange) {
-  const bar = document.getElementById(barElId);
-  if (!bar) return;
-  bar.innerHTML = "";
-
-  // Sub-category labels, in the order first encountered in the classification file,
-  // restricted to actions that belong to the currently active main category.
-  const subsInOrder = [];
-  actions.forEach(function (a) {
-    if (categoryOf(a.type) !== mainCategory) return;
-    const sub = subCategoryOf(a);
-    if (sub && subsInOrder.indexOf(sub) === -1) subsInOrder.push(sub);
-  });
-
-  if (subsInOrder.length === 0) {
-    setActiveSub(null);
-    return; // 呢個大分類冇任何子分類資料 - 唔顯示呢層 tab bar
-  }
-
-  const allBtn = document.createElement("button");
-  allBtn.className = "sub-tab-btn" + (getActiveSub() === null ? " active" : "");
-  allBtn.textContent = uiLang === "en" ? "All" : "全部";
-  allBtn.onclick = function () {
-    setActiveSub(null);
-    onChange();
-  };
-  bar.appendChild(allBtn);
-
-  subsInOrder.forEach(function (sub, i) {
-    const btn = document.createElement("button");
-    btn.className = "sub-tab-btn" + (sub === getActiveSub() ? " active" : "");
-    btn.style.setProperty("--sub-tab-color", SUB_CATEGORY_COLORS[i % SUB_CATEGORY_COLORS.length]);
-    const count = actions.filter(function (a) {
-      return categoryOf(a.type) === mainCategory && subCategoryOf(a) === sub;
-    }).length;
-    btn.textContent = subCategoryDisplayName(sub) + " (" + count + ")";
-    btn.onclick = function () {
-      setActiveSub(sub);
-      onChange();
-    };
-    bar.appendChild(btn);
-  });
-}
-
-/** 建動作 chip 清單嘅共用邏輯 - 邊個 list element、邊批經 filter 嘅動作、點樣攞
- *  顯示名、撳落去做咩、清單為空顯示咩字, 全部由 caller 決定。 */
-function renderActionChips(listElId, filtered, nameFn, onPick, emptyText) {
-  const listEl = document.getElementById(listElId);
-  if (!listEl) return;
-  if (filtered.length === 0) {
-    listEl.textContent = emptyText;
-    return;
-  }
-  listEl.innerHTML = "";
-  filtered.forEach(function (a) {
-    const chip = document.createElement("div");
-    chip.className = "chip";
-    chip.textContent = nameFn(a);
-    chip.onclick = function () { onPick(a); };
-    listEl.appendChild(chip);
-  });
-}
-
-
-// 用喺 Lynx LED tab 嘅眼/頭色點揀色器 (lynxBuildEyeColorPicker()/
-// lynxBuildHeadColorPicker(), 見 app-lynx.js)。呢個 helper 本身冇 Lynx-only
-// 定 Alpha2-only 之分, 純粹係一個共用 DOM utility, 所以擺喺 app-core.js (第一
-// 個 load 嘅檔案) 等所有其他 app-*.js 都用得到。
-const LED_COLORS = [
-  { code: 1, name: "紅", hex: "#ff3b3b" },
-  { code: 2, name: "綠", hex: "#3bff5c" },
-  { code: 3, name: "藍", hex: "#3b6bff" },
-  { code: 4, name: "黃", hex: "#ffe93b" },
-  { code: 5, name: "紫", hex: "#a83bff" },
-  { code: 6, name: "青", hex: "#3bfff0" },
-  { code: 7, name: "白", hex: "#ffffff" },
-];
-
-function buildColorPicker(wrapId, getSelected, setSelected, onPick) {
-  // 之前試過冇 null check, 一旦 wrapId 打錯或者 index.html 個對應 element 被
-  // 誤刪, document.getElementById() 會返 null, wrap.innerHTML 即刻
-  // TypeError —— 而呢個 function 兩個 call site
-  // (lynxBuildEyeColorPicker/lynxBuildHeadColorPicker) 都喺頁面初始化
-  // (DOMContentLoaded 果條 call chain) 連續執行, 其中一個掉低就會拋出未捕獲
-  // 例外, 中斷埋後面幾行初始化 (連累 lynxRefreshStatus()/lynxRefreshSys()/
-  // connectWs() 都行唔到), 令狀態頁睇落一片空白、讀唔到機身 data, 卻冇任何
-  // 錯誤提示喺 UI 度 (window.onerror 會 log 落 console/logcat, 但畫面本身
-  // 一片空白)。加返 guard: 揾唔到就靜靜哋跳過呢一個 color picker, 唔阻住
-  // 其他初始化步驟。
-  const wrap = document.getElementById(wrapId);
-  if (!wrap) {
-    console.error("buildColorPicker: element #" + wrapId + " not found, skipping");
-    return;
-  }
-  wrap.innerHTML = "";
-  LED_COLORS.forEach(function (c) {
-    const dot = document.createElement("button");
-    dot.type = "button";
-    dot.className = "color-dot" + (c.code === getSelected() ? " selected" : "");
-    dot.style.background = c.hex;
-    dot.title = c.name;
-    dot.onclick = function () {
-      setSelected(c.code);
-      wrap.querySelectorAll(".color-dot").forEach(function (d) { d.classList.remove("selected"); });
-      dot.classList.add("selected");
-      onPick();
-    };
-    wrap.appendChild(dot);
-  });
-}
-
+const APP_REPO_URL = "https://github.com/arthurson/ubtech-open-alpha2";
+const XIAOZHI_CONSOLE_URL = "https://xiaozhi.me/";
 
 // ---------------- UI language (whole-panel zh/en translation) ----------------
 //
 // Single source of truth for language across the whole panel - this drives both the
 // surrounding UI chrome (headings, button labels, static hints) via [data-i18n]-tagged
-// elements, AND which language action names display as (chips in the Actions tabs -
-// see displayNameOf()/lynxDisplayNameOf() below). There used to be a separate
-// per-tab action-name-language toggle (activeActionLang/activeLynxActionLang); it was
-// removed so there's only ever one language switch in the whole app - see README.
+// elements, AND which language action names display as (chips in the Actions tab -
+// see displayNameOf() below). There used to be a separate per-tab action-name-language
+// toggle (activeActionLang); it was removed so there's only ever one language switch
+// in the whole app - see README.
 let uiLang = localStorage.getItem("ui_lang") || "zh";
 
 // key -> {zh, en}. Applied to any element carrying data-i18n="key" via textContent,
@@ -261,99 +36,285 @@ const I18N = {
   // -- nav bar --
   nav_status:             { zh: "📊 狀態",          en: "📊 Status" },
   nav_actions:            { zh: "🕺 動作",          en: "🕺 Actions" },
+  nav_servo:              { zh: "⚙️ 舵機",          en: "⚙️ Servo" },
   nav_motor:              { zh: "⚙️ 舵機",          en: "⚙️ Servo" },
   nav_speech:             { zh: "🗣️ 語音",          en: "🗣️ Speech" },
   nav_led:                { zh: "💡 LED",           en: "💡 LED" },
   nav_camera:             { zh: "📷 相機",          en: "📷 Camera" },
+  nav_advanced:           { zh: "🧪 進階",          en: "🧪 Advanced" },
+  nav_blockly:            { zh: "🧩 積木編程 ↗",   en: "🧩 Blockly ↗" },
+  nav_blockly_title:      { zh: "喺新分頁開 Blockly 積木編程", en: "Open Blockly visual programming in a new tab" },
 
   // -- status tab --
+  status_system_label:   { zh: "系統：", en: "System:" },
   lang_switch_label:     { zh: "語言：", en: "Language:" },
+  status_heading:        { zh: "系統狀態",        en: "Status" },
+  device_info_heading:   { zh: "裝置資訊",        en: "Device Info" },
+  device_battery:        { zh: "🔋 電池",         en: "🔋 Battery" },
+  device_wifi:           { zh: "📶 WiFi",         en: "📶 WiFi" },
+  device_bluetooth:      { zh: "🔷 藍牙",         en: "🔷 Bluetooth" },
+  device_uuid:           { zh: "🤖 機械人 UUID",  en: "🤖 Robot UUID" },
+  uuid_query_btn:        { zh: "查詢",            en: "Query" },
+  head_noise_heading:    { zh: "頭部降噪",        en: "Head Noise Reduction" },
+  sonar_heading:         { zh: "聲納",            en: "Sonar" },
   accel_heading:         { zh: "加速度計",        en: "Accelerometer" },
   tilt_led_toggle_label: { zh: "4角度傾側著頭/眼LED", en: "4-direction tilt lights up head/eye LED" },
+  tilt_led_direction_prefix: { zh: "目前傾側方向: ", en: "Current tilt direction: " },
+  tilt_led_monitoring_hint: { zh: "監測中… (要先開返上面個「加速度計」開關先會收到讀數)",
+                               en: "Monitoring… (turn on the \u201cAccelerometer\u201d switch above first to receive readings)" },
   accel_turning_on_hint: { zh: "開啟中…", en: "Turning on…" },
   accel_turn_on_failed_hint: { zh: "開啟失敗", en: "Failed to turn on" },
   accel_move_hint:       { zh: "鬱動 / 傾斜機身睇下數據變化", en: "Move / tilt the robot to see the readings change" },
+  uuid_querying_hint:    { zh: "查詢中…", en: "Querying…" },
 
   // -- actions tab --
-  lynx_actions_heading:  { zh: "動作 (Actions)",  en: "Actions" },
+  actions_heading:       { zh: "動作 (Actions)",  en: "Actions" },
   actions_load_btn:      { zh: "攞動作列表",      en: "Load Action List" },
+  action_name_placeholder:{ zh: "動作名稱 e.g. ACT0", en: "Action name e.g. ACT0" },
   action_play_btn:       { zh: "播放",            en: "Play" },
   action_stop_btn:       { zh: "停止",            en: "Stop" },
-  lynx_action_id_placeholder: { zh: "動作 ID（撳上面嘅 chip 自動填入並播放，或自行輸入例如 wave01）", en: "Action ID (tap a chip above to auto-fill and play, or type e.g. wave01)" },
-  lynx_action_id_hint:   { zh: "播放要用動作 ID（.ubx 檔名），唔係顯示名稱 — 撳上面嘅 chip 會即刻播放 (撳新嘅動作會自動停咗個舊嘅先播)",
-                            en: "Playback uses the action ID (.ubx filename), not the display name — tapping a chip above plays it immediately (tapping a new one auto-stops the previous)" },
+
+  // -- servo tab --
+  servo_heading:         { zh: "舵機 (Servos, 1–20)", en: "Servos (1–20)" },
+  servo_hint:            { zh: "拖動滑桿, 放手即送出, 自動夾喺安全範圍內。", en: "Drag a slider and release to send — values are auto-clamped to a safe range." },
+  servo_time_label:      { zh: "時間(ms)：",       en: "Time (ms):" },
+  servo_reset_btn:       { zh: "全部回到中位",     en: "Reset All to Center" },
+  servo_power_save:      { zh: "省電",             en: "Power Save" },
+
+  // -- speech tab --
+  asr_heading:           { zh: "ASR (語音辨識)",   en: "ASR (Speech Recognition)" },
+  engine_label:          { zh: "引擎：",           en: "Engine:" },
+  asr_start_btn:         { zh: "開始聆聽",         en: "Start Listening" },
+  asr_stop_btn:          { zh: "停止聆聽",         en: "Stop Listening" },
+  tts_heading:           { zh: "語音 / TTS",       en: "Speech / TTS" },
+  tts_text_placeholder:  { zh: "要講嘅文字",       en: "Text to speak" },
+  tts_speak_btn:         { zh: "講嘢 (TTS)",       en: "Speak (TTS)" },
+  tts_stop_btn:          { zh: "停止 TTS",         en: "Stop TTS" },
+  mic_card_heading:      { zh: "🎙️ 麥克風擁有權", en: "🎙️ Microphone Ownership" },
+  mic_card_hint:         { zh: "控制邊個持有麥克風 - App (畀 TTS/Mic Listen 用) 定係機械人自己 (畀 wake word / ASR 用)。同一時間淨係得一方可以用。",
+                            en: "Controls who holds the microphone - the app (for TTS/Mic Listen) or the robot itself (for wake word / ASR). Only one side can hold it at a time." },
+  mic_release_btn:       { zh: "釋放麥克風俾 App", en: "Release Mic to App" },
+  mic_return_btn:        { zh: "交返麥克風俾機器人", en: "Return Mic to Robot" },
+  mic_state_on:          { zh: "App 持有中", en: "Held by app" },
+  mic_state_off:         { zh: "已交返俾機械人", en: "Returned to robot" },
+  mic_keep_held_label:   { zh: "持續搶 Mic (唔俾機械人自動攞返)", en: "Keep holding mic (auto re-take from robot)" },
+  mic_keep_held_hint:    { zh: "開咗之後, 就算機械人韌體內部側面攞返 mic (例如 wake-word 引擎自己觸發), app 都會每幾秒自動搶返 - 直到你自己撳「交返麥克風俾機器人」或者閂返呢個掣為止。",
+                            en: "When on, even if the robot's firmware internally re-takes the mic on its own (e.g. the wake-word engine triggering it), the app will automatically re-take it every few seconds - until you either return it manually or turn this off." },
+  self_interrupt_label:  { zh: "自我打斷",         en: "Self-Interrupt" },
+  volume_heading:        { zh: "媒體音量",         en: "Media Volume" },
+  volume_hint:           { zh: "控制機械人喇叭嘅媒體音量 (STREAM_MUSIC)，同實體 +/- 按鈕共用同一個音量。",
+                            en: "Controls the robot speaker's media volume (STREAM_MUSIC) — shares the same level as the physical +/- buttons." },
+
+  // -- LED tab (Alpha2) --
+  led_head_heading:      { zh: "頭部 LED",         en: "Head LED" },
+  led_eye_heading:       { zh: "眼睛 LED",         en: "Eye LED" },
+  led_mouth_heading:     { zh: "咀部 LED",         en: "Mouth LED" },
+  led_color_label:       { zh: "顏色：",           en: "Color:" },
+  led_brightness_label:  { zh: "亮度 (1–9)：",     en: "Brightness (1–9):" },
+  led_mouth_speed_label: { zh: "速度 (0–5000)：",  en: "Speed (0–5000):" },
+  led_preset_long:       { zh: "💡 長開",          en: "💡 On" },
+  led_preset_flash:      { zh: "⚡ 閃燈",          en: "⚡ Flash" },
+  led_preset_breathe:    { zh: "🫧 呼吸燈",        en: "🫧 Breathe" },
+  led_preset_breathe_mouth: { zh: "🫁 呼吸燈",     en: "🫁 Breathe" },
+  led_preset_chase:      { zh: "🏃 跑馬燈",        en: "🏃 Chase" },
+  led_preset_dual:       { zh: "🎨 雙色燈",        en: "🎨 Dual Color" },
+  led_preset_stop:       { zh: "⏹ 停止",          en: "⏹ Stop" },
 
   // -- camera tab --
   camera_heading:        { zh: "相機",             en: "Camera" },
   camera_feature_key:    { zh: "功能鍵",           en: "Feature Key" },
 
-  // -- Lynx status --
-  lynx_status_heading:   { zh: "系統狀態 (Lynx 3.0.0.2)", en: "Status (Lynx 3.0.0.2)" },
-  lynx_device_info_heading: { zh: "裝置資訊", en: "Device Info" },
-  lynx_device_sid:       { zh: "🆔 SID",          en: "🆔 SID" },
-  lynx_device_battery_ver: { zh: "🔋 電池版本",    en: "🔋 Battery Version" },
-  lynx_device_power:     { zh: "⚡ 電量",          en: "⚡ Power" },
-  lynx_device_charging:  { zh: "🔌 充電中",        en: "🔌 Charging" },
-  lynx_device_mic_ver:   { zh: "🎙️ MIC 版本",     en: "🎙️ MIC Version" },
-  lynx_device_head_ver:  { zh: "🧠 頭部版本",      en: "🧠 Head Version" },
-  lynx_device_chest_ver: { zh: "🫁 胸部版本",      en: "🫁 Chest Version" },
-  lynx_charging_yes:     { zh: "是", en: "Yes" },
-  lynx_charging_no:      { zh: "否", en: "No" },
+  // -- Alpha2 版 PIR card (見 index.html/app-servo.js/app-accel.js 嘅 comment) --
+  // 2026-08-15 更新: 真機已確認 PIR 觸發正常, 移除 "未經真機驗證" 個 hint。
+  alpha2_pir_heading:       { zh: "PIR 感應器", en: "PIR Sensor" },
+  alpha2_pir_switch_label:  { zh: "感應器開關", en: "Sensor Switch" },
+  alpha2_pir_alert_label:   { zh: "警示反應 (LED+鈴聲)", en: "Alert Reaction (LED + Chime)" },
 
-  // -- Lynx PIR --
-  lynx_pir_heading:      { zh: "PIR 感應器", en: "PIR Sensor" },
-  lynx_pir_switch_label: { zh: "感應器開關", en: "Sensor Switch" },
-  lynx_pir_alert_label:  { zh: "警示反應 (LED+鈴聲)", en: "Alert Reaction (LED + Chime)" },
+  // -- Alpha2 speech tab (ASR card) --
+  asr_reset_btn:          { zh: "🔄 重置語音 (實驗)", en: "🔄 Reset Speech (Experimental)" },
+  asr_reset_btn_title:    { zh: "試驗性: 切換引擎後 TTS 失聲時試下呢個, 睇下用唔用得返, 唔使重開機",
+                             en: "Experimental: if TTS goes silent after switching engines, try this before rebooting" },
+  asr_current_engine_unswitched: { zh: "目前引擎：未切換", en: "Current engine: not switched" },
+  asr_procedure_warning:  { zh: "⚠️ <b>要有反應必須跟足呢個次序：</b>\n        (0) 撳「中文 (iFlytek)」或「英文 (Nuance)」——會即刻重新綁定 speech service, 等\n        speech_ready event 返嚟 (見上面「🔀 ASR 引擎已切換去」log) 先算完成;\n        (1) 撳「開始聆聽」——呢個淨係將 speech engine 撥入接收 wake word 嘅狀態,\n        唔係即刻開始錄音;\n        (2) 對住機械人講 wake word（實測確認：機身 config 寫死 <code>CN_WAKEUP_NIHAO_ALPHA</code>\n        = <b>「你好，Alpha」</b>，唔可以自訂/唔可以跳過）觸發硬件 mic array 偵測——呢個 wake word\n        偵測本身一直用緊 iFlytek 嘅硬件 CAE 引擎，唔受呢度揀 Nuance/iFlytek 影響;\n        (3) 偵測到之後先真正開始錄音辨識, 呢陣先可以講指令。\n        <br>\n        ⚠️ <b>2026-08 logcat 覆核發現（推翻上面舊結論）：</b>\n        機身韌體自己 (<code>AlphaMainSeviceImpl</code>) 開機時已經自己 bind 咗一份獨立嘅\n        speech service, wake word 偵測 + TTS 提示全部行呢條獨立路徑，<b>完全唔受呢度\n        「切引擎」呢個 app 側 API 影響</b>——即係話呢個掣淨係改緊你自己個 app 主動\n        call `speech/tts` 或者 `speech/start_asr` 果條路徑，唔會令你聽到嘅 wake word\n        回答變聲、變語言。想改開機 wake word 用邊種語言，要用下面「⚙️ 機身語言設定」\n        個 preset (需要重開機)。\n        <br>\n        ⚠️ <b>Confidence 門檻</b>（反編譯 <code>Alpha2Services-v1.1.7.3.20</code> 證實）：\n        自由辨識（wake word 之後嗰段，唔係下面嘅語法式辨識）由頭到尾都行 <b>Nuance</b>\n        （<code>NuanceASRImpl</code>）。\n        Local recognition confidence 要 ≥4500 先會直接接受；低於此分數會嘗試等雲端補完，\n        但 Nuance 雲端伺服器已停用，所以低分結果實際上會全部失敗。<b>企近部機、慢慢講、\n        咬字清楚</b>可以提高 confidence。已確認用英文完整短句得（例如 \"wave the left hand\"，\n        唔好淨講單字），見下面已知指令參考。\n        <br>\n        想試真正嘅 iFlytek 辨識（唔經 wake word 嘅自由語音，而係 grammar 限定詞彙）：\n        先撳「中文 (iFlytek)」切換引擎，再用下面「語音輸入三合一測試」card 嘅「語法式辨識」測試。",
+                             en: "⚠️ <b>For a response you must follow this exact sequence:</b>\n        (0) Press \u201cChinese (iFlytek)\u201d or \u201cEnglish (Nuance)\u201d — this immediately re-binds the speech\n        service; wait for the speech_ready event (see the \u201c🔀 ASR engine switched to\u201d log above) before\n        continuing;\n        (1) Press \u201cStart Listening\u201d — this only puts the speech engine into wake-word-receiving\n        state, it does not start recording immediately;\n        (2) Say the wake word to the robot (confirmed by testing: the on-device config hardcodes\n        <code>CN_WAKEUP_NIHAO_ALPHA</code>\n        = <b>\u201c你好，Alpha\u201d (\u201cHello, Alpha\u201d)</b>, which cannot be customized or skipped) to trigger the hardware mic array\n        detection — this wake-word detection always runs on iFlytek's hardware CAE engine, regardless of the\n        Nuance/iFlytek choice here;\n        (3) Only after detection does it actually start recording/recognition — this is when you can speak a command.\n        <br>\n        ⚠️ <b>2026-08 logcat review finding (overturns the conclusion above):</b>\n        The robot's own firmware (<code>AlphaMainSeviceImpl</code>) already binds its own separate\n        speech service at boot; wake-word detection + TTS prompts all run through that independent path,\n        <b>completely unaffected by this app-side \u201cswitch engine\u201d API</b> — meaning this button only\n        changes the path your own app actively calls via `speech/tts` or `speech/start_asr`; it will not\n        change the voice or language of the wake-word response you hear. To change which language the\n        boot-time wake word uses, use the preset in \u201c⚙️ On-Device Language Settings\u201d below (requires a reboot).\n        <br>\n        ⚠️ <b>Confidence threshold</b> (confirmed by decompiling <code>Alpha2Services-v1.1.7.3.20</code>):\n        free recognition (the part after the wake word, not the grammar-based recognition below) runs\n        entirely on <b>Nuance</b> (<code>NuanceASRImpl</code>).\n        Local recognition confidence needs to be ≥4500 to be accepted directly; below that it tries to wait\n        for cloud completion, but the Nuance cloud server is permanently offline, so low-confidence results\n        effectively all fail. <b>Standing close to the robot, speaking slowly, and enunciating clearly</b> can\n        raise the confidence score. Confirmed to work with full English sentences (e.g. \"wave the left hand\",\n        not single words) — see the known-command reference below.\n        <br>\n        To try genuine iFlytek recognition (free speech without a wake word, but limited to grammar-defined\n        vocabulary): press \u201cChinese (iFlytek)\u201d above to switch engines first, then use \u201cGrammar-based\n        Recognition\u201d in the \u201cSpeech Input 3-in-1 Test\u201d card below." },
+  asr_result_label:       { zh: "📝 辨識結果", en: "📝 Recognition Result" },
+  asr_intent_label:       { zh: "🎯 意圖分類 (rule/action)", en: "🎯 Intent Classification (rule/action)" },
+  asr_known_commands_summary: { zh: "📖 已知內建指令參考（Nuance offline grammar，喺 Nuance binding 之下用）",
+                                 en: "📖 Known Built-in Command Reference (Nuance offline grammar, used under Nuance binding)" },
+  asr_known_commands_intro: { zh: "機身有兩個 speech engine：<b>Nuance VoCon</b>（offline，內建喺\n          <code>alpha2services</code>）同 <b>iFlytek</b>。經反編譯 <code>Alpha2Services-v1.1.7.3.20</code>\n          證實：Nuance 呢邊 <code>speech_initGrammar</code>／<code>startSpeechGrammar</code>\n          係完全未實作嘅空 stub（method body 得一句 <code>return-void</code>），自訂詞彙一律唔會生效；\n          但呢邊有一個獨立、寫死喺 native code 嘅內建 grammar（下面呢個表），單靠 local recognition\n          就會 work，唔使雲端（Nuance 雲端伺服器已停用，但呢個內建 grammar 唔靠佢）。\n          單字容易 mis-parse（例如淨係講\"wave\"可能會 match 錯做 QA），建議用完整短句\n          （例如「wave your left hand」）。\n          <br><br>\n          ⚠️ <b>Confidence 門檻</b>：反編譯證實 local recognition 嘅 confidence 分數要 ≥4500\n          先會直接接受（唔使等雲端）；低於呢個門檻會判 invalid、等雲端補完——但雲端已停用，\n          所以低於 4500 分嘅結果實際上會全部有去無回。想提高成功率：<b>企近部機、慢慢講、\n          咬字清楚、減少背景噪音</b>，呢啲都會直接影響 confidence 分數。\n          <br><br>\n          想試 iFlytek（中文，有真身 grammar 實作，未反查完整語法格式）：先用 ASR card 嘅\n          「中文 (iFlytek)」切換引擎，再用下面「語音輸入三合一測試」。",
+                                 en: "The robot has two speech engines: <b>Nuance VoCon</b> (offline, built into\n          <code>alpha2services</code>) and <b>iFlytek</b>. Confirmed by decompiling <code>Alpha2Services-v1.1.7.3.20</code>:\n          on the Nuance side, <code>speech_initGrammar</code>/<code>startSpeechGrammar</code>\n          is a completely unimplemented empty stub (method body is just <code>return-void</code>), so custom vocabulary\n          never takes effect; but there's a separate built-in grammar hardcoded in native code (the table below) that\n          works purely via local recognition without needing the cloud (the Nuance cloud server is offline, but this\n          built-in grammar doesn't depend on it).\n          Single words are prone to mis-parsing (e.g. saying just \"wave\" might mis-match as QA); full sentences are\n          recommended (e.g. \u201cwave your left hand\u201d).\n          <br><br>\n          ⚠️ <b>Confidence threshold</b>: decompiling confirms local recognition's confidence score needs to be ≥4500\n          to be accepted directly (without waiting for the cloud); below this threshold it's judged invalid and waits\n          for cloud completion — but the cloud is offline, so results below 4500 effectively go nowhere. To improve\n          success rate: <b>stand close to the robot, speak slowly, enunciate clearly, and reduce background\n          noise</b> — these all directly affect the confidence score.\n          <br><br>\n          To try iFlytek (Chinese, has a real grammar implementation, exact grammar format not fully reverse-engineered):\n          first switch engines using \u201cChinese (iFlytek)\u201d on the ASR card, then use \u201cSpeech Input 3-in-1 Test\u201d below." },
+  asr_cmd_action_heading: { zh: "Action_Performance（動作，機械人會自己鬱，可能搶咗你自訂嘅action）：",
+                             en: "Action_Performance (actions — the robot moves on its own, may override your custom actions):" },
+  asr_cmd_qa_heading:     { zh: "QA（問答，機械人淨係用把口答，唔會鬱——最穩陣測試呢組）：",
+                             en: "QA (questions & answers — the robot only replies verbally, doesn't move — safest group to test):" },
+  asr_cmd_system_heading: { zh: "系統／裝置：", en: "System / Device:" },
+  asr_cmd_move_label:     { zh: "移動：", en: "Move: " },
+  asr_cmd_arm_label:      { zh: "手臂：", en: "Arm: " },
+  asr_cmd_leg_label:      { zh: "腿/姿勢：", en: "Leg/Pose: " },
+  asr_cmd_head_label:     { zh: "頭：", en: "Head: " },
+  asr_cmd_expression_label: { zh: "表情：", en: "Expression: " },
+  asr_cmd_sit_down:       { zh: "sit down（squat）", en: "sit down (squat)" },
+  asr_cmd_self_check:     { zh: "self check（連線／電量／電源／儲存／音量／WiFi 狀態）",
+                             en: "self check (connection / battery / power / storage / volume / WiFi status)" },
 
-  // -- Lynx servo tab --
-  lynx_servo_heading:    { zh: "舵機 (Servo, 1–20)", en: "Servos (1–20)" },
-  lynx_servo_hint:       { zh: "拖動滑桿放手即送出。讀取結果 (code) 顯示喺滑桿右邊, 淨係撳「讀取所有角度」先會更新。",
-                            en: "Drag a slider and release to send. The readout appears next to each slider, and only updates when you press \u201cRead All Angles\u201d." },
-  lynx_servo_time_label: { zh: "時間(ms)：", en: "Time (ms):" },
-  lynx_servo_reset_btn:  { zh: "全部回到中位", en: "Reset All to Center" },
-  lynx_servo_read_all_btn: { zh: "讀取所有角度", en: "Read All Angles" },
-  lynx_servo_power_save: { zh: "省電", en: "Power Save" },
+  // -- Alpha2 speech tab (3-in-1 test card) --
+  speech_test_heading:    { zh: "語音輸入三合一測試（同一句嘢，睇邊個功能有反應）",
+                             en: "Speech Input 3-in-1 Test (same phrase, see which feature responds)" },
+  speech_test_intro:      { zh: "呢度3條係唔同嘅AIDL method，用**同一句輸入**一齊送出，方便你直接對比邊個先真係work：",
+                             en: "These are 3 different AIDL methods, sent together with **the same input**, so you can directly compare which one actually works:" },
+  speech_test_li_inject_label: { zh: "模擬講嘢", en: "Simulated Speech" },
+  speech_test_li_grammar_label: { zh: "語法式辨識", en: "Grammar-based Recognition" },
+  speech_test_li_nlu_label: { zh: "文字語意理解", en: "Text Understanding" },
+  speech_test_li_inject:  { zh: "（<code>onSpeech</code> dictation，未測試，SDK標咗 <code>@Deprecated</code> 但搵唔到原因）——\n          如果work，結果會經返「ASR」card嘅「辨識結果」／「意圖分類」顯示（同真正講嘢一樣嘅path）",
+                             en: " (<code>onSpeech</code> dictation, untested, SDK marks it <code>@Deprecated</code> but no reason found) —\n          if it works, the result shows via the \u201cASR\u201d card's \u201cRecognition Result\u201d/\u201cIntent Classification\u201d (same path as actually speaking)" },
+  speech_test_li_grammar: { zh: "（<code>initSpeechGrammar</code> → <code>startSpeechGrammar</code>）——\n          ⚠️ 已反編譯確認：Nuance binding 之下係空 stub，一定失敗；要撞到 iFlytek\n          嘅真身實作（<code>com.iflytek.cloud.SpeechRecognizer</code>），要自己先用上面\n          「中文 (iFlytek)」掣切換，未切嘅話呢個測試會直接回傳 backend 個 guard error。\n          <code>strGrammar</code> 確實語法格式仍未反查完整，會將你打嘅嘢原封不動送去",
+                             en: " (<code>initSpeechGrammar</code> → <code>startSpeechGrammar</code>) —\n          ⚠️ confirmed by decompiling: it's an empty stub under Nuance binding and will always fail; to reach iFlytek's\n          real implementation (<code>com.iflytek.cloud.SpeechRecognizer</code>), switch engines using \u201cChinese\n          (iFlytek)\u201d above first — without switching, this test just returns the backend's guard error.\n          The exact <code>strGrammar</code> format hasn't been fully reverse-engineered yet; whatever you type is sent as-is" },
+  speech_test_li_nlu:     { zh: "（<code>onTextUnderstand</code>，⚠️ 已confirm冧咗）——約1ms就返、\n          冇觸發任何callback，需要雲端但雲端伺服器已停用，留低純粹做對比基準",
+                             en: " (<code>onTextUnderstand</code>, ⚠️ confirmed broken) — returns in about 1ms,\n          no callback fires, needs the cloud which is offline, kept purely as a comparison baseline" },
+  speech_test_input_placeholder: { zh: "輸入任何一句話，例如：stand up / how old are you",
+                                    en: "Type any sentence, e.g.: stand up / how old are you" },
+  speech_test_run_all_btn: { zh: "一齊試曬 ▶", en: "Test All ▶" },
+  speech_test_inject_label: { zh: "🗣️ 模擬講嘢 (inject)", en: "🗣️ Simulated Speech (inject)" },
+  speech_test_inject_sent: { zh: "已送出，睇上面ASR card", en: "Sent, check the ASR card above" },
+  speech_test_grammar_label: { zh: "📖 語法式辨識 (grammar)", en: "📖 Grammar-based Recognition (grammar)" },
+  speech_test_nlu_label:  { zh: "🧠 文字語意理解 (NLU)", en: "🧠 Text Understanding (NLU)" },
+  speech_test_stop_inject_btn: { zh: "停止模擬講嘢", en: "Stop Simulated Speech" },
+  speech_test_stop_grammar_btn: { zh: "停止語法辨識", en: "Stop Grammar Recognition" },
+  speech_test_grammar_result_label: { zh: "🎯 語法辨識結果 (start之後先有)", en: "🎯 Grammar Recognition Result (only after start)" },
 
-  // -- Lynx speech tab --
-  lynx_tts_heading:      { zh: "TTS 播放 (Android 內置)", en: "TTS Playback (Built-in Android)" },
-  lynx_tts_text_placeholder: { zh: "要講嘅文字", en: "Text to speak" },
-  lynx_tts_speak_btn:    { zh: "播放", en: "Speak" },
-  lynx_tts_stop_btn:     { zh: "停止", en: "Stop" },
-  lynx_tts_engine_label: { zh: "TTS 引擎：", en: "TTS Engine:" },
-  lynx_tts_engine_placeholder: { zh: "(撳右邊掣載入)", en: "(press the button on the right to load)" },
-  lynx_tts_engine_load_btn: { zh: "攞引擎列表", en: "Load Engine List" },
-  lynx_tts_lang_label:   { zh: "語言：", en: "Language:" },
-  lynx_tts_lang_placeholder: { zh: "(先揀引擎)", en: "(choose an engine first)" },
-  lynx_tts_lang_load_btn: { zh: "攞語言列表", en: "Load Language List" },
-  lynx_tts_engine_loading: { zh: "載入緊…", en: "Loading…" },
-  lynx_tts_engine_load_empty: { zh: "(讀唔到引擎列表 - 機身冇裝任何 TTS engine？)",
-                                 en: "(Couldn\u2019t read the engine list - no TTS engine installed on the robot?)" },
-  lynx_tts_switching_engine: { zh: "切緊 engine…", en: "Switching engine…" },
-  lynx_tts_lang_load_empty: { zh: "(讀唔到語言列表 - engine 未 ready？)",
-                               en: "(Couldn\u2019t read the language list - engine not ready?)" },
-  // -- Lynx LED tab --
-  lynx_led_heading:      { zh: "LED", en: "LED" },
-  lynx_led_head_heading: { zh: "頭部 LED", en: "Head LED" },
-  lynx_led_eye_heading:  { zh: "眼睛 LED", en: "Eye LED" },
-  lynx_led_mouth_heading:{ zh: "咀部 LED", en: "Mouth LED" },
-  lynx_led_wifi_heading: { zh: "WiFi 燈", en: "WiFi Light" },
-  lynx_led_color_label:  { zh: "顏色：", en: "Color:" },
-  lynx_led_brightness_label: { zh: "光度 (1–9)：", en: "Brightness (1–9):" },
-  lynx_led_speed_label:  { zh: "速度 (0–1000)：", en: "Speed (0–1000):" },
-  lynx_led_mouth_brightness_label: { zh: "光暗 (1-9)：", en: "Brightness (1-9):" },
-  lynx_led_mouth_speed_label: { zh: "速度 (0-1000ms)：", en: "Speed (0-1000ms):" },
-  lynx_led_mouth_off_time_label: { zh: "OffTime (1-1000)：", en: "Off Time (1-1000):" },
-  lynx_led_preset_long:  { zh: "💡 長開", en: "💡 On" },
-  lynx_led_preset_flash: { zh: "⚡ 閃燈", en: "⚡ Flash" },
-  lynx_led_preset_breathe: { zh: "🫧 呼吸燈", en: "🫧 Breathe" },
-  lynx_led_preset_breathe_mouth: { zh: "🫁 呼吸燈", en: "🫁 Breathe" },
-  lynx_led_preset_marquee: { zh: "🏃 跑馬燈", en: "🏃 Chase" },
-  lynx_led_preset_blink: { zh: "👁 眨眼", en: "👁 Blink" },
-  lynx_led_preset_stop:  { zh: "⏹ 停止", en: "⏹ Stop" },
-  lynx_led_mouth_on_btn: { zh: "長開", en: "On" },
-  lynx_led_mouth_off_btn:{ zh: "停止", en: "Stop" },
-  lynx_led_wifi_red_btn: { zh: "紅色", en: "Red" },
-  lynx_led_wifi_blue_btn:{ zh: "藍色", en: "Blue" },
+  // -- Alpha2 speech tab (TTS engine/voice buttons) --
+  tts_engine_iflytek_btn: { zh: "iFlytek (訊飛)", en: "iFlytek" },
+  tts_engine_android_btn: { zh: "Android 預設", en: "Android Default" },
+  tts_voice_label:        { zh: "聲音：", en: "Voice:" },
+  tts_voice_default_btn:  { zh: "南南", en: "Nannan (default)" },
+
+  // -- Alpha2 speech tab (on-device language settings) --
+  service_config_heading: { zh: "⚙️ 機身語言設定", en: "⚙️ On-Device Language Settings" },
+  service_config_hint:    { zh: "切換機身 wake word／ASR 語言（跟原廠設定），寫入後要重開機先生效。",
+                             en: "Switches the robot's wake-word/ASR language (following the factory settings) — takes effect after a reboot." },
+  service_config_cn_btn:  { zh: "🇨🇳 中文（你好 阿爾法）", en: "🇨🇳 Chinese (你好 阿爾法)" },
+  service_config_en_btn:  { zh: "🇺🇸 英文（Hello Alpha）", en: "🇺🇸 English (Hello Alpha)" },
+  service_config_reboot_btn: { zh: "🔁 立即重開機", en: "🔁 Reboot Now" },
+
+  // -- Alpha2 speech tab (ASR engine switch buttons + dynamic status strings) --
+  asr_switch_zh_btn:      { zh: "中文 (iFlytek)", en: "Chinese (iFlytek)" },
+  asr_switch_en_btn:      { zh: "英文 (Nuance)", en: "English (Nuance)" },
+  asr_switching_to:       { zh: "切緊去 {label} 引擎 (重新綁定 speech service 中)…",
+                             en: "Switching to {label} engine (re-binding speech service)…" },
+  asr_current_engine_switching: { zh: "目前引擎：切換中… ({label})", en: "Current engine: switching… ({label})" },
+  asr_switch_failed_prefix: { zh: "切換引擎失敗: ", en: "Failed to switch engine: " },
+  asr_current_engine_switch_failed: { zh: "目前引擎：切換失敗", en: "Current engine: switch failed" },
+  asr_pick_engine_first:  { zh: "請先揀「中文 (iFlytek)」或「英文 (Nuance)」",
+                             en: "Please choose \u201cChinese (iFlytek)\u201d or \u201cEnglish (Nuance)\u201d first" },
+  asr_rebinding_wait:     { zh: "引擎重新綁定緊，請等 speech_ready 之後再試",
+                             en: "Engine is re-binding, please wait for speech_ready and try again" },
+  asr_preparing_listen:   { zh: "準備聆聽中 — 而家講 \"hello alpha\" 觸發硬件 wake word 偵測，先會真正開始錄音…",
+                             en: "Preparing to listen — say \"hello alpha\" now to trigger hardware wake-word detection, then recording actually starts…" },
+  asr_stopped:            { zh: "已停止", en: "Stopped" },
+  asr_resetting:          { zh: "重置緊…", en: "Resetting…" },
+  asr_reset_sent_ok:      { zh: "已送出重置指令，試下撳返「播放 TTS」有冇聲返嚟",
+                             en: "Reset command sent — try pressing \u201cPlay TTS\u201d again to see if sound comes back" },
+  asr_reset_failed_prefix: { zh: "重置失敗：", en: "Reset failed: " },
+  asr_reset_failed_unknown: { zh: "未知錯誤", en: "Unknown error" },
+
+  // -- Alpha2 speech tab (service config + 3-in-1 test dynamic strings) --
+  service_config_writing:  { zh: "寫入緊…", en: "Writing…" },
+  service_config_write_ok: { zh: "✅ 已寫入，記得重開機先會生效。", en: "✅ Written — remember to reboot for it to take effect." },
+  service_config_write_failed_prefix: { zh: "❌ 失敗：", en: "❌ Failed: " },
+  service_config_reboot_confirm: { zh: "確定要立即重開機？", en: "Reboot now?" },
+  service_config_rebooting: { zh: "重開機緊…", en: "Rebooting…" },
+  service_config_reboot_ok: { zh: "✅ 重開機緊…", en: "✅ Rebooting…" },
+  service_config_reboot_failed_prefix: { zh: "❌ 重開機失敗：", en: "❌ Reboot failed: " },
+  service_config_reboot_failed_suffix: { zh: "（請手動 power-cycle）", en: " (please power-cycle manually)" },
+  speech_test_enter_text_alert: { zh: "請輸入文字", en: "Please enter some text" },
+  speech_test_grammar_init:  { zh: "初始化緊…", en: "Initializing…" },
+  speech_test_nlu_analyzing: { zh: "分析緊…", en: "Analyzing…" },
+  speech_test_grammar_init_failed: { zh: "初始化失敗", en: "Initialization failed" },
+  asr_engine_ready_hint:  { zh: "引擎已就緒，可以撳「開始聆聽」", en: "Engine ready — you can press \u201cStart Listening\u201d" },
+  asr_engine_switched_log_prefix: { zh: "🔀 ASR 引擎已切換去: ", en: "🔀 ASR engine switched to: " },
+  asr_current_engine_prefix: { zh: "目前引擎：", en: "Current engine: " },
+  log_error_code_prefix:  { zh: "錯誤 (code=", en: "Error (code=" },
+
+  // -- advanced tab (Alpha2 only; raw AIDL passthrough, unverified-hardware methods) --
+  adv_actions_heading:        { zh: "動作：進階",              en: "Actions: Advanced" },
+  adv_action_file_placeholder:{ zh: "動作檔案路徑",            en: "Action file path" },
+  adv_action_file_play_btn:   { zh: "用檔案播放",              en: "Play by File" },
+  adv_action_disable_btn:     { zh: "停用動作播放",            en: "Disable Action Playback" },
+  adv_action_enable_btn:      { zh: "啟用動作播放",            en: "Enable Action Playback" },
+  adv_action_query_btn:       { zh: "查詢是否播放緊",          en: "Query Is Actioning" },
+  adv_event_param_placeholder:{ zh: "param (base64, 可留空)",  en: "param (base64, optional)" },
+  adv_event_trigger_btn:      { zh: "觸發事件",                en: "Trigger Event" },
+  adv_action_hint:            { zh: "event_type / param 嘅實際意義未經真機驗證。",
+                                  en: "The real meaning of event_type / param is unverified against real hardware." },
+  adv_speech_heading:         { zh: "語音：英文理解 / ASR 回放", en: "Speech: English Understand / ASR Replay" },
+  adv_english_understand_btn: { zh: "註冊英文理解 (線上)",     en: "Register English Understand (Online)" },
+  adv_english_offline_btn:    { zh: "註冊英文理解 (離線)",     en: "Register English Understand (Offline)" },
+  adv_replay_register_btn:    { zh: "註冊 ASR 歷史回放",       en: "Register ASR History Replay" },
+  adv_speech_hint:             { zh: "呢三個 API 具體喺咩情況下觸發回呼未經真機驗證，結果會顯示喺呢度同事件 Log。",
+                                  en: "Exactly when these three APIs fire a callback is unverified against real hardware — results show here and in the event log." },
+  adv_serial_heading:         { zh: "序列埠：原始資料",        en: "Serial: Raw Data" },
+  adv_serial_target_label:    { zh: "目標：",                  en: "Target:" },
+  adv_serial_data_placeholder:{ zh: "data (base64)",           en: "data (base64)" },
+  adv_serial_send_btn:        { zh: "送出",                    en: "Send" },
+  adv_serial_number_btn:      { zh: "攞機身序號",              en: "Get Serial Number" },
+  adv_bt_heading:              { zh: "藍牙序列埠",              en: "Bluetooth Serial" },
+  adv_bt_send_cmd_btn:        { zh: "送出命令",                en: "Send Command" },
+  adv_bt_at_placeholder:      { zh: "AT 指令",                 en: "AT command" },
+  adv_bt_send_at_btn:         { zh: "送出 AT 指令",            en: "Send AT Command" },
+  adv_bt_hint:                 { zh: "呢個係機身藍牙序列埠連線，同上面「裝置資訊」嘅系統藍牙開關係兩回事。收到嘅資料會顯示喺事件 Log (bt_rcv)。",
+                                  en: "This is the robot's Bluetooth serial link, separate from the system Bluetooth toggle in Device Info above. Received data appears in the event log (bt_rcv)." },
+
+  // -- xiaozhi (小智 AI 對話) --
+  nav_xiaozhi:                { zh: "🤖 小智",              en: "🤖 XiaoZhi" },
+  xiaozhi_heading:            { zh: "🤖 小智 AI 對話",       en: "🤖 XiaoZhi AI Chat" },
+  xiaozhi_phase4_hint:        { zh: "開關開＝配對／連線／隨時語音對話，關＝斷開。首次要喺 xiaozhi.me 輸入機械人讀出嘅配對碼。",
+                                 en: "Switch on = pair/connect/voice chat anytime, off = disconnect. First time, enter the pairing code the robot speaks at xiaozhi.me." },
+  xiaozhi_unsupported_hint:   { zh: "呢部機嘅 Android 版本過舊，語音對話功能將會停用（純文字對話不受影響）。",
+                                 en: "This device's Android version is too old for voice chat - it will be disabled (text-only chat is unaffected)." },
+  xiaozhi_activation_prompt:  { zh: "請喺 <a href=\"https://xiaozhi.me/console/\" target=\"_blank\" rel=\"noopener\">xiaozhi.me</a> 輸入以下配對碼：",
+                                 en: "Please enter the pairing code below at <a href=\"https://xiaozhi.me/console/\" target=\"_blank\" rel=\"noopener\">xiaozhi.me</a>:" },
+  xiaozhi_activation_code_chat_prefix: { zh: "🔑 配對碼：", en: "🔑 Pairing code:" },
+  xiaozhi_activation_modal_prompt: { zh: "請喺 <a href=\"https://xiaozhi.me/console/\" target=\"_blank\" rel=\"noopener\">xiaozhi.me</a> 輸入以下配對碼：",
+                                 en: "Please enter the pairing code below at <a href=\"https://xiaozhi.me/console/\" target=\"_blank\" rel=\"noopener\">xiaozhi.me</a>:" },
+  xiaozhi_activation_modal_dismiss: { zh: "知道喇", en: "Got it" },
+  xiaozhi_session_toggle_label: { zh: "🤖 小智（開＝連線並隨時語音對話，關＝斷開）", en: "🤖 XiaoZhi (on = connect & voice chat anytime, off = disconnect)" },
+  xiaozhi_status_disconnected:{ zh: "未連接",               en: "Disconnected" },
+  xiaozhi_status_checking:    { zh: "檢查中…",              en: "Checking…" },
+  xiaozhi_status_awaiting_code: { zh: "等待配對…",          en: "Awaiting pairing…" },
+  xiaozhi_status_connecting:  { zh: "連接中…",              en: "Connecting…" },
+  xiaozhi_status_connected:   { zh: "已連接",               en: "Connected" },
+  xiaozhi_status_error:       { zh: "連接失敗",             en: "Connection failed" },
+  xiaozhi_mic_held:           { zh: "🎤 麥克風：已攞到（語音對話中）", en: "🎤 Mic: acquired (voice chat active)" },
+  xiaozhi_mic_released:       { zh: "🎤 麥克風：已放低",            en: "🎤 Mic: released" },
+  xiaozhi_ota_custom_heading: { zh: "⚙️ 自訂小智 server",     en: "⚙️ Custom XiaoZhi server" },
+  xiaozhi_ota_custom_label:   { zh: "開＝自架 server，關＝官方 xiaozhi.me",
+                                 en: "On = self-hosted server, off = official xiaozhi.me" },
+  xiaozhi_ota_custom_hint:    { zh: "淨係 OTA 位址係必填；其餘留空會自動攞返嚟，連接住期間唔可以更改。",
+                                 en: "Only the OTA URL is required; leave the rest blank to fetch automatically. Cannot be changed while connected." },
+  xiaozhi_ota_field_ota:      { zh: "OTA 位址",             en: "OTA URL" },
+  xiaozhi_ota_field_ws:       { zh: "WebSocket 位址",        en: "WebSocket URL" },
+  xiaozhi_ota_field_mac:      { zh: "MAC (Device-Id)",      en: "MAC (Device-Id)" },
+  xiaozhi_ota_field_token:    { zh: "Token",                en: "Token" },
+  xiaozhi_ota_custom_save:    { zh: "儲存",                  en: "Save" },
+  xiaozhi_ota_custom_saved:   { zh: "✅ 已儲存自訂 server 設定",     en: "✅ Custom server settings saved" },
+  xiaozhi_ota_custom_error:   { zh: "❌ 儲存失敗",              en: "❌ Failed to save" },
+  xiaozhi_ota_custom_url_required: { zh: "請先填寫 OTA 位址",       en: "Please enter an OTA URL first" },
+  xiaozhi_mcp_tools_heading:  { zh: "🔧 內置MCP功能列表",       en: "🔧 Built-in MCP Tools" },
+  xiaozhi_mcp_tools_hint:     { zh: "控制呢部機向小智暴露邊啲工具。同 xiaozhi.me console 嘅「MCP接入點」係兩回事。",
+                                 en: "Control which tools this device exposes to XiaoZhi. Not the same as xiaozhi.me console's \"MCP access point\"." },
+  xiaozhi_mcp_tools_expand_label: { zh: "展開",              en: "Expand" },
+  xiaozhi_mcp_tools_refresh:  { zh: "重新整理",              en: "Refresh" },
+  xiaozhi_mcp_tools_loading:  { zh: "載入中…",               en: "Loading…" },
+  xiaozhi_mcp_tools_empty:    { zh: "未有可用工具",          en: "No tools available" },
+  xiaozhi_mcp_tools_error:    { zh: "❌ 讀取失敗",              en: "❌ Failed to load" },
+  xiaozhi_mcp_call_label:     { zh: "工具呼叫",             en: "Tool call" },
+  xiaozhi_console_heading:    { zh: "🌐 小智控制台",          en: "🌐 XiaoZhi Console" },
+  xiaozhi_console_open_btn:   { zh: "前往 xiaozhi.me",       en: "Open xiaozhi.me" },
+  xiaozhi_text_placeholder:   { zh: "打字同小智傾偈…",       en: "Type a message to XiaoZhi…" },
+  xiaozhi_send_text:          { zh: "送出",                 en: "Send" },
+  xiaozhi_send_text_error:    { zh: "送出失敗",             en: "Failed to send" },
+  xiaozhi_stop_all_btn:       { zh: "⏹ 全部停止",           en: "⏹ Stop All" },
+  xiaozhi_stop_all_hint:      { zh: "停止動作／語音／音樂／電台", en: "Stops action, speech, music and radio" },
 
   // -- event log --
   event_log_heading:     { zh: "即時事件 Log (WebSocket)", en: "Live Event Log (WebSocket)" },
@@ -405,21 +366,21 @@ function setUiLanguage(lang) {
   applyUiLanguage();
   // Category tab labels (基本/跳舞/... and 全部) are built dynamically from
   // ACTION_CATEGORIES, not tagged with data-i18n, so applyUiLanguage() alone won't
-  // update them - re-run the builder if the action list is already loaded.
-  if (typeof lynxAllActions !== "undefined" && lynxAllActions.length > 0) {
-    buildLynxActionSubTabs();
-    lynxRenderActionList();
+  // update them - re-run the builders if the action lists are already loaded.
+  if (allActions.length > 0) {
+    buildActionSubTabs();
+    renderActionList();
   }
   // Servo group/slider labels are also built dynamically (not [data-i18n]-tagged) -
-  // relabel in place rather than calling buildServoGrid()/lynxBuildServoGrid() again,
-  // since a full rebuild would reset every slider back to its calibrated home
-  // position and lose whatever angle the person currently has dialled in.
+  // relabel in place rather than calling buildServoGrid() again, since a full rebuild
+  // would reset every slider back to its calibrated home position and lose whatever
+  // angle the person currently has dialled in.
   relabelServoGrid();
 }
 
 /** Re-applies servo group headings and #id-name slider labels for the current
- *  uiLang, on both the Alpha2 and Lynx servo grids, without touching slider
- *  positions/values (see setUiLanguage() above for why not to rebuild). */
+ *  uiLang, without touching slider positions/values (see setUiLanguage() above for
+ *  why not to rebuild). */
 function relabelServoGrid() {
   document.querySelectorAll(".servo-group").forEach(function (groupEl, idx) {
     const group = SERVO_GROUPS[idx % SERVO_GROUPS.length];
@@ -437,7 +398,12 @@ function relabelServoGrid() {
   });
 }
 
-// ---------------- HTTP helpers ----------------
+// ---------------- Backend ----------------
+// currentBackend 保留呢個變數 (而唔係將所有 currentBackend === "alpha2" 嘅
+// guard 全部拆晒) 純粹係為咗減少呢次改動嘅範圍 - app-camera.js/app-mic.js
+// 呢類檔案有唔少 "if (currentBackend !== 'alpha2') return;" 呢類 guard, 留低
+// 呢個常數等佢哋原封不動照樣 work。
+const currentBackend = "alpha2";
 
 // Surface any uncaught JS exception to console.error, which MainActivity's
 // WebChromeClient.onConsoleMessage() forwards to logcat (tag "WebViewConsole"). Without
@@ -529,71 +495,10 @@ const SERVO_GROUPS = [
   { key: "left-leg",   label: "左腳", labelEn: "L Leg",     icon: "🦵", ids: [12, 13, 14, 15, 16] },
 ];
 
-/** 建立 servo grid 嘅共用邏輯 - 邊個 caller 用邊個 wrap element id / slider id
- *  prefix / 送出去 robot 嘅 call, 全部由參數決定。
- *  @param wrapId       外層容器嘅 id ("lynxServoGroups")
- *  @param sliderPrefix slider input 嘅 id prefix ("lynxServoSlider_")
- *  @param valPrefix    數值顯示 span 嘅 id prefix ("lynxServoSliderVal_")
- *  @param sendFn       (id, angle) => void, 拖完手之後實際送出去robot嘅call
- *                       (motor/move_absolute, 見 caller)
- *  @param readPrefix   (可選) 「讀取所有角度」結果顯示 span 嘅 id prefix - 冇傳嘅話
- *                       唔會加呢欄, 版面同以前一樣。
- */
-function buildServoGridInto(wrapId, sliderPrefix, valPrefix, sendFn, readPrefix) {
-  const wrap = document.getElementById(wrapId);
-  if (!wrap) {
-    console.error("buildServoGridInto: #" + wrapId + " not found, skipping");
-    return;
-  }
-  wrap.innerHTML = "";
-  SERVO_GROUPS.forEach(function (group) {
-    const groupEl = document.createElement("div");
-    groupEl.className = "servo-group";
-
-    const title = document.createElement("div");
-    title.className = "servo-group-title";
-    title.innerHTML = "<span class=\"servo-group-icon\">" + group.icon + "</span>" + (uiLang === "en" ? group.labelEn : group.label);
-    groupEl.appendChild(title);
-
-    group.ids.forEach(function (id) {
-      const cal = SERVO_CALIBRATION[id];
-      const row = document.createElement("div");
-      row.className = "servo-slider-row" + (readPrefix ? " has-readout" : "");
-      row.innerHTML =
-          "<span class=\"servo-slider-label\">#" + id + " " + servoNameOf(id) + "</span>" +
-          "<input type=\"range\" id=\"" + sliderPrefix + id + "\" min=\"" + cal.min + "\" max=\"" + cal.max + "\" value=\"" + cal.home + "\">" +
-          "<span class=\"servo-slider-value\" id=\"" + valPrefix + id + "\">" + cal.home + "</span>" +
-          (readPrefix ? "<span class=\"servo-slider-readout\" id=\"" + readPrefix + id + "\">-</span>" : "");
-      const slider = row.querySelector("input");
-      const valueLabel = row.querySelector(".servo-slider-value");
-
-      // Live readout while dragging - no network call yet.
-      slider.addEventListener("input", function () {
-        valueLabel.textContent = slider.value;
-      });
-      // Actually move the servo once the drag ends.
-      slider.addEventListener("change", function () {
-        const raw = parseInt(slider.value, 10);
-        const clamped = clampServoAngle(id, isNaN(raw) ? cal.home : raw);
-        if (clamped !== raw) {
-          slider.value = clamped;
-          valueLabel.textContent = clamped;
-        }
-        sendFn(id, clamped);
-      });
-
-      groupEl.appendChild(row);
-    });
-
-    wrap.appendChild(groupEl);
-  });
-}
-
 // ---------------- Global error surface ----------------
 // Any uncaught JS error used to fail silently (a button's onclick handler would just
 // stop executing with nothing visible in the page). Both a global handler and every
-// hwApi()/lynxApi() call now route failures through here so the UI always shows
-// *something*.
+// api() call now route failures through here so the UI always shows *something*.
 
 function showError(context, err) {
   const banner = document.getElementById("errorBanner");
@@ -616,15 +521,10 @@ window.addEventListener("unhandledrejection", function (e) {
   showError("Unhandled promise rejection", e.reason);
 });
 
-// This app only supports the Lynx backend now - hwApi() always hits the same
-// no-prefix "/api/..." endpoints (handleSharedHardwareApi() server-side) that
-// lynxApi() doesn't cover. Kept as its own function (rather than inlining
-// fetch() everywhere) so hardware endpoints and Lynx AIDL endpoints stay visually
-// distinct at each call site, matching the rest of this file's naming.
-function hwApi(path, params) {
+function api(path, params) {
   clearError();
   const qs = params ? "?" + new URLSearchParams(params).toString() : "";
-  return fetch(API + path + qs).then(function (res) {
+  return fetch(API + "alpha2/" + path + qs).then(function (res) {
     return res.json().catch(function (e) {
       return { ok: false, error: "invalid response (status " + res.status + ")" };
     }).then(function (json) {
@@ -642,22 +542,10 @@ function hwApi(path, params) {
   });
 }
 
-// Every Lynx (3.0.0.2) AIDL-backed endpoint goes through here ("/api/lynx/...").
-function lynxApi(path, params) {
-  clearError();
-  const qs = params ? "?" + new URLSearchParams(params).toString() : "";
-  return fetch(API + "lynx/" + path + qs).then(function (res) {
-    return res.json().catch(function (e) {
-      return { ok: false, error: "invalid response (status " + res.status + ")" };
-    }).then(function (json) {
-      if (!json.ok) {
-        showError("API /lynx/" + path, new Error(json.error || json.code || "request failed"));
-      }
-      return json;
-    });
-  }).catch(function (networkErr) {
-    showError("Network error calling /lynx/" + path, networkErr);
-    return { ok: false, error: String(networkErr) };
-  });
+// Camera and audio-testtone/volume/play are plain Android hardware access, not
+// implemented by the AIDL backend itself - same physical camera/mic/speaker
+// regardless of robot SDK version, so this is really just an alias for api().
+function hwApi(path, params) {
+  return api(path, params);
 }
 
